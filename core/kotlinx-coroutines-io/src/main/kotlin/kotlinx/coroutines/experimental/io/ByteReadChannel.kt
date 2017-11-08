@@ -148,12 +148,11 @@ suspend fun ByteReadChannel.joinTo(dst: ByteWriteChannel, closeOnEnd: Boolean) {
 }
 
 private suspend fun ByteReadChannel.joinToImpl(dst: ByteWriteChannel, close: Boolean) {
+    copyToImpl(dst, Long.MAX_VALUE)
     if (close) {
-        copyToImpl(dst, Long.MAX_VALUE)
-        dst.flush()
-    } else {
-        copyToImpl(dst, Long.MAX_VALUE)
         dst.close()
+    } else {
+        dst.flush()
     }
 }
 

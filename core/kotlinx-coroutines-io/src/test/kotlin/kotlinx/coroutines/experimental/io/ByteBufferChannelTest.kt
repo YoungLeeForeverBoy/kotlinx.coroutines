@@ -12,8 +12,7 @@ import org.junit.rules.ErrorCollector
 import org.junit.rules.Timeout
 import java.nio.CharBuffer
 import java.util.*
-import java.util.concurrent.TimeUnit
-import kotlin.system.*
+import java.util.concurrent.*
 import kotlin.test.assertEquals
 import kotlin.test.assertNotEquals
 import kotlin.test.assertTrue
@@ -684,31 +683,40 @@ class ByteBufferChannelTest {
     @Test
     fun testJoinToLarge() {
         val count = 1024 * 256 // * 8192 = 2Gb
+        val closed = CountDownLatch(1)
 
-        launch {
-            val bb = ByteBuffer.allocate(8192)
-            for (i in 0 until bb.capacity()) {
-                bb.put((i and 0xff).toByte())
+        val writerJob = launch {
+            try {
+                val bb = ByteBuffer.allocate(8192)
+                for (i in 0 until bb.capacity()) {
+                    bb.put((i and 0xff).toByte())
+                }
+
+                for (i in 1..count) {
+                    bb.clear()
+                    val split = i and 0x1fff
+
+                    bb.limit(split)
+                    ch.writeFully(bb)
+                    yield()
+                    bb.limit(bb.capacity())
+                    ch.writeFully(bb)
+                }
+
+                println("Fuck!")
+                ch.close()
+                println("After fuck!")
+                closed.countDown()
+            } catch (t: Throwable) {
+                failures.addError(t)
+                t.printStackTrace()
             }
-
-            for (i in 1..count) {
-                bb.clear()
-                val split = i and 0x1fff
-
-                bb.limit(split)
-                ch.writeFully(bb)
-                yield()
-                bb.limit(bb.capacity())
-                ch.writeFully(bb)
-            }
-
-            ch.close()
         }
 
         val dest = ByteBufferChannel(true, pool)
 
         val joinerJob = launch {
-           ch.joinTo(dest, true)
+            ch.joinTo(dest, true)
         }
 
         val reader = launch {
@@ -726,15 +734,28 @@ class ByteBufferChannelTest {
                 }
             }
 
-            yield()
+            bb.clear()
+            assertEquals(-1, dest.readAvailable(bb))
             assertTrue(dest.isClosedForRead)
         }
 
         runBlocking {
+            println("waiting for reader")
             reader.join()
+            println("waiting for joiner")
             joinerJob.join()
-            dest.close()
-            ch.close()
+            println("waiting for writer")
+            writerJob.join()
+        }
+
+        writerJob.invokeOnCompletion(true) { t ->
+            t?.let { throw it }
+        }
+        reader.invokeOnCompletion(true) { t ->
+            t?.let { throw it }
+        }
+        joinerJob.invokeOnCompletion(true) { t ->
+            t?.let { throw it }
         }
     }
 
@@ -808,10 +829,11 @@ class ByteBufferChannelTest {
         launch(coroutineContext) {
             ch.joinTo(other, false)
         }
-        yield()
 
         ch.writeInt(0x11223344)
         ch.flush()
+
+        yield()
 
         assertEquals(0x12345678, other.readInt())
         assertEquals(0x11223344, other.readInt())
@@ -829,6 +851,32 @@ class ByteBufferChannelTest {
                     child.writeInt(i)
                     child.close()
                 }
+                child.joinTo(ch, false)
+            }
+        }
+
+        for (i in 1..steps) {
+            assertEquals(i, ch.readInt())
+        }
+
+        pipeline.join()
+        pipeline.invokeOnCompletion { cause ->
+            cause?.let { throw it }
+        }
+    }
+
+    @Test
+    fun testSequentialJoinYield() = runBlocking<Unit> {
+        val steps = 200_000
+
+        val pipeline = launch(coroutineContext) {
+            for (i in 1..steps) {
+                val child = ByteBufferChannel(false, pool)
+                launch(coroutineContext) {
+                    child.writeInt(i)
+                    child.close()
+                }
+                yield()
                 child.joinTo(ch, false)
             }
         }
