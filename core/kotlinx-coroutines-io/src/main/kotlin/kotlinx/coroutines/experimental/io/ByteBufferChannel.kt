@@ -94,14 +94,18 @@ internal class ByteBufferChannel(
     override fun flush() {
         delegatedTo?.let { delegated -> delegated.flush(); return }
 
+        val avw: Int
         while (true) {
             val s = state
             if (!s.capacity.flush()) return
-            if (s === state) break
+            if (s === state) {
+                avw = s.capacity.availableForWrite
+                break
+            }
         }
 
         resumeReadOp()
-        if (availableForWrite > 0) resumeWriteOp()
+        if (avw > 0) resumeWriteOp()
     }
 
     private fun ByteBuffer.prepareBuffer(order: ByteOrder, position: Int, available: Int) {
