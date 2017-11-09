@@ -13,6 +13,7 @@ import org.junit.rules.Timeout
 import java.nio.CharBuffer
 import java.util.*
 import java.util.concurrent.*
+import java.util.concurrent.atomic.*
 import kotlin.test.assertEquals
 import kotlin.test.assertNotEquals
 import kotlin.test.assertTrue
@@ -683,34 +684,25 @@ class ByteBufferChannelTest {
     @Test
     fun testJoinToLarge() {
         val count = 1024 * 256 // * 8192 = 2Gb
-        val closed = CountDownLatch(1)
 
         val writerJob = launch {
-            try {
-                val bb = ByteBuffer.allocate(8192)
-                for (i in 0 until bb.capacity()) {
-                    bb.put((i and 0xff).toByte())
-                }
-
-                for (i in 1..count) {
-                    bb.clear()
-                    val split = i and 0x1fff
-
-                    bb.limit(split)
-                    ch.writeFully(bb)
-                    yield()
-                    bb.limit(bb.capacity())
-                    ch.writeFully(bb)
-                }
-
-                println("Fuck!")
-                ch.close()
-                println("After fuck!")
-                closed.countDown()
-            } catch (t: Throwable) {
-                failures.addError(t)
-                t.printStackTrace()
+            val bb = ByteBuffer.allocate(8192)
+            for (i in 0 until bb.capacity()) {
+                bb.put((i and 0xff).toByte())
             }
+
+            for (i in 1..count) {
+                bb.clear()
+                val split = i and 0x1fff
+
+                bb.limit(split)
+                ch.writeFully(bb)
+                yield()
+                bb.limit(bb.capacity())
+                ch.writeFully(bb)
+            }
+
+            ch.close()
         }
 
         val dest = ByteBufferChannel(true, pool)
@@ -739,24 +731,19 @@ class ByteBufferChannelTest {
             assertTrue(dest.isClosedForRead)
         }
 
-        runBlocking {
-            println("waiting for reader")
-            reader.join()
-            println("waiting for joiner")
-            joinerJob.join()
-            println("waiting for writer")
-            writerJob.join()
+        val latch = CountDownLatch(1)
+        val r = AtomicInteger(3)
+
+        val handler: CompletionHandler = { t ->
+            t?.let { failures.addError(it); latch.countDown() }
+            if (r.decrementAndGet() == 0) latch.countDown()
         }
 
-        writerJob.invokeOnCompletion(true) { t ->
-            t?.let { throw it }
-        }
-        reader.invokeOnCompletion(true) { t ->
-            t?.let { throw it }
-        }
-        joinerJob.invokeOnCompletion(true) { t ->
-            t?.let { throw it }
-        }
+        reader.invokeOnCompletion(true, handler)
+        writerJob.invokeOnCompletion(true, handler)
+        joinerJob.invokeOnCompletion(true, handler)
+
+        latch.await()
     }
 
     private fun launch(block: suspend () -> Unit): Job {

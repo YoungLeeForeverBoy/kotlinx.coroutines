@@ -60,7 +60,7 @@ internal class ByteBufferChannel(
         get() = state.capacity.availableForWrite
 
     override val isClosedForRead: Boolean
-        get() = state === ReadWriteBufferState.Terminated
+        get() = state === ReadWriteBufferState.Terminated && closed != null
 
     override val isClosedForWrite: Boolean
         get() = closed != null
@@ -74,7 +74,6 @@ internal class ByteBufferChannel(
         private set
 
     override fun close(cause: Throwable?): Boolean {
-        println("try close...")
         if (closed != null) return false
         val newClosed = if (cause == null) ClosedElement.EmptyCause else ClosedElement(cause)
         state.capacity.flush()
@@ -84,13 +83,8 @@ internal class ByteBufferChannel(
         resumeClosed(cause)
 
 
-        println("Complete close")
-        Exception().printStackTrace()
-
         if (state === ReadWriteBufferState.Terminated) {
-            joining?.let { ensureClosedJoined(it) } ?: println("not joined")
-        } else {
-            println("not terminated")
+            joining?.let { ensureClosedJoined(it) }
         }
 
         return true
@@ -216,11 +210,11 @@ internal class ByteBufferChannel(
         }
     }
 
-    private fun setupDelegateTo(delegate: ByteBufferChannel, delegateClose: Boolean) {
+    private fun setupDelegateTo(delegate: ByteBufferChannel, delegateClose: Boolean): JoiningState {
         require(this !== delegate)
 
-        this.joining = JoiningState(delegate, delegateClose)
-        resumeWriteOp()
+        val joined = JoiningState(delegate, delegateClose)
+        this.joining = joined
 
         val alreadyClosed = closed
         if (alreadyClosed != null) {
@@ -230,6 +224,26 @@ internal class ByteBufferChannel(
         } else {
             flush()
         }
+
+        return joined
+    }
+
+    private fun tryCompleteJoining(joined: JoiningState): Boolean {
+        updateState { state ->
+            when {
+                state === ReadWriteBufferState.Terminated -> state
+                state === ReadWriteBufferState.IdleEmpty -> ReadWriteBufferState.Terminated
+                // we don't handle IdleNonEmpty as it should be switched to IdleEmpty in restoreStateAfterRead
+                else -> return false
+            }
+        }
+
+        ensureClosedJoined(joined)
+
+        ReadOp.getAndSet(this, null)?.resumeWithException(IllegalStateException("Joining is in progress"))
+        WriteOp.getAndSet(this, null)?.resume(Unit)
+
+        return true
     }
 
     private fun tryTerminate(): Boolean {
@@ -242,6 +256,7 @@ internal class ByteBufferChannel(
                 state === ReadWriteBufferState.Terminated -> return true
                 state === ReadWriteBufferState.IdleEmpty -> ReadWriteBufferState.Terminated
                 closed.cause != null && state is ReadWriteBufferState.IdleNonEmpty -> {
+                    // here we don't need to tryLockForRelease as we already have closed state
                     toRelease = state.initial
                     ReadWriteBufferState.Terminated
                 }
@@ -1053,9 +1068,8 @@ internal class ByteBufferChannel(
         }
         closed?.let { closed -> throw closed.sendException }
 
-        src.setupDelegateTo(this, delegateClose)
-        copyDirect(src, Long.MAX_VALUE, leaveOnDelegation = true)
-        src.resumeWriteOp()
+        val joined = src.setupDelegateTo(this, delegateClose)
+        copyDirect(src, Long.MAX_VALUE, joined)
 
         if (delegateClose && src.isClosedForRead) {
             close()
@@ -1065,8 +1079,15 @@ internal class ByteBufferChannel(
         }
     }
 
-    internal suspend fun copyDirect(src: ByteBufferChannel, limit: Long, leaveOnDelegation: Boolean): Long {
-        if (limit == 0L || src.isClosedForRead) return 0L
+    internal suspend fun copyDirect(src: ByteBufferChannel, limit: Long, joined: JoiningState?): Long {
+        if (limit == 0L) return 0L
+        if (src.isClosedForRead) {
+            if (joined != null) {
+                check(tryCompleteJoining(joined))
+            }
+            return 0L
+        }
+
         val autoFlush = autoFlush
         val byteOrder = writeByteOrder
 
@@ -1120,20 +1141,20 @@ internal class ByteBufferChannel(
                     }
                 }
 
-                //if (src.isClosedForRead) break
                 flush()
 
-                if (leaveOnDelegation) {
-                    if (src.tryShutdownForDelegation()) break
-                    else if (src.state.capacity.flush()) {
+                if (joined != null) {
+                    if (src.tryCompleteJoining(joined)) break
+                    else if (src.state.capacity.flush()) { // force flush src to read-up all the bytes
                         src.resumeWriteOp()
                         continue
                     }
                 }
 
+                if (joining != null) break // TODO think of joining chain
+
                 if (!src.readSuspend(1))  {
-                    if (!leaveOnDelegation || src.tryShutdownForDelegation())
-                    break
+                    if (joined == null || src.tryCompleteJoining(joined)) break
                 }
             }
 
@@ -1141,9 +1162,9 @@ internal class ByteBufferChannel(
                 flush()
             }
 
-            if (!leaveOnDelegation) {
-                joining?.let { joined ->
-                    return copied + joined.delegatedTo.copyDirect(src, limit - copied, leaveOnDelegation)
+            if (joined == null) {
+                joining?.let { thisJoined ->
+                    return copied + thisJoined.delegatedTo.copyDirect(src, limit - copied, null)
                 }
             }
 
@@ -1160,44 +1181,11 @@ internal class ByteBufferChannel(
 
         if (joined.delegateClose) {
             joined.delegatedTo.close(closed.cause)
-            println("delegated close")
         } else {
             joined.delegatedTo.flush()
         }
 
         joined.complete()
-    }
-
-    private fun tryShutdownForDelegation(): Boolean {
-        val joined = joining ?: return false
-
-        var toRelease: ReadWriteBufferState.Initial? = null
-
-        updateState { state ->
-            when {
-                state === ReadWriteBufferState.Terminated -> state
-                state === ReadWriteBufferState.IdleEmpty -> ReadWriteBufferState.Terminated
-                state is ReadWriteBufferState.IdleNonEmpty && state.capacity.isEmpty() -> {
-                    toRelease = state.initial
-                    ReadWriteBufferState.Terminated
-                }
-                else -> return false
-            }
-        }
-
-
-        toRelease?.let { buffer ->
-            releaseBuffer(buffer)
-        }
-
-        ensureClosedJoined(joined)
-
-        ReadOp.getAndSet(this, null)?.resume(false)
-        WriteOp.getAndSet(this, null)?.resume(Unit)
-
-        println("shutdown...., $state")
-
-        return true
     }
 
     private fun writeAsMuchAsPossible(src: ByteBuffer): Int {
@@ -1791,6 +1779,7 @@ internal class ByteBufferChannel(
     }
 
     private suspend fun writeSuspend(size: Int) {
+//        println("Write suspend (enter)")
         while (writeSuspendPredicate(size)) {
             suspendCancellableCoroutine<Unit>(holdCancellability = true) { c ->
                 do {
@@ -1802,10 +1791,12 @@ internal class ByteBufferChannel(
                 } while (!setContinuation({ writeOp }, WriteOp, c, { writeSuspendPredicate(size) }))
 
                 flush()
+//                println("Write suspend (loop), op = ${writeOp}, state = $state, joined = $joining")
             }
         }
 
         closed?.sendException?.let { throw it }
+//        println("Write suspend (leave)")
     }
 
     private inline fun <T, C : CancellableContinuation<T>> setContinuation(getter: () -> C?, updater: AtomicReferenceFieldUpdater<ByteBufferChannel, C?>, continuation: C, predicate: () -> Boolean): Boolean {
@@ -1886,7 +1877,7 @@ internal class ByteBufferChannel(
         }
     }
 
-    private class JoiningState(val delegatedTo: ByteBufferChannel, val delegateClose: Boolean) {
+    internal class JoiningState(val delegatedTo: ByteBufferChannel, val delegateClose: Boolean) {
         private val _closeWaitJob = atomic<Job?>(null)
         private val closed = atomic(0)
 
